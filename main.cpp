@@ -3,6 +3,7 @@
 #include <iomanip>
 #include <deque>
 #include <cmath>
+#include <algorithm>
 #include "Engine.hpp"
 #include "Portfolio.hpp"
 #include "FastFileReader.hpp"
@@ -39,65 +40,84 @@ inline void skip_column(const char*& ptr, const char* end) {
     if (ptr < end && *ptr == ',') ptr++;
 }
 
-class RollingZScoreStrategy : public IStrategy {
+class MomentumBreakoutStrategy : public IStrategy {
 private:
     Portfolio& portfolio_;
     double entry_price_{0.0};
+    double highest_price_since_entry_{0.0};
     double last_price_{0.0};
 
-    static constexpr size_t WINDOW_SIZE = 200;
+    // Parámetros de ventana para canal y volumen
+    static constexpr size_t WINDOW_SIZE = 600; // ~600 ticks para detectar niveles clave
     std::deque<double> price_window_;
-    double rolling_sum_{0.0};
+    std::deque<uint32_t> volume_window_;
+    uint64_t volume_sum_{0};
 
-    // Parámetros de control de riesgo para volatilidad de Bitcoin
-    static constexpr double STOP_LOSS_PCT = 0.004;   // 0.4% Stop Loss
-    static constexpr double TAKE_PROFIT_PCT = 0.006; // 0.6% Take Profit
-    static constexpr double Z_ENTRY = 2.2;           // 2.2 desviaciones estándar
+    // Parámetros de gestión de salida dinámica
+    static constexpr double INITIAL_STOP_PCT = 0.004;  // 0.4% Stop inicial de seguridad
+    static constexpr double TRAILING_STOP_PCT = 0.003; // 0.3% Trailing stop dinámico
+    
+    // Filtro de enfriamiento
+    uint64_t ticks_since_exit_{1000};
+    static constexpr uint64_t COOLDOWN_TICKS = 300;
 
 public:
-    explicit RollingZScoreStrategy(Portfolio& p) : portfolio_(p) {}
+    explicit MomentumBreakoutStrategy(Portfolio& p) : portfolio_(p) {}
 
     void on_tick(const Tick& tick) override {
         last_price_ = tick.price;
+        ticks_since_exit_++;
 
+        // Actualización de ventana rodante de precios
         price_window_.push_back(tick.price);
-        rolling_sum_ += tick.price;
+        volume_window_.push_back(tick.volume);
+        volume_sum_ += tick.volume;
 
         if (price_window_.size() > WINDOW_SIZE) {
-            rolling_sum_ -= price_window_.front();
             price_window_.pop_front();
+            volume_sum_ -= volume_window_.front();
+            volume_window_.pop_front();
         }
 
         if (price_window_.size() < WINDOW_SIZE) return;
 
-        double mean = rolling_sum_ / WINDOW_SIZE;
-
-        double var_sum = 0.0;
-        for (double p : price_window_) {
-            var_sum += (p - mean) * (p - mean);
-        }
-        double std_dev = std::sqrt(var_sum / WINDOW_SIZE);
-        if (std_dev < 1e-4) return;
-
-        double z_score = (tick.price - mean) / std_dev;
-
-        // 1. Gestión de posición abierta
+        // 1. Gestión de Posición Abierta con Trailing Stop
         if (portfolio_.get_position() > 0) {
-            double pnl_pct = (tick.price - entry_price_) / entry_price_;
+            if (tick.price > highest_price_since_entry_) {
+                highest_price_since_entry_ = tick.price;
+            }
 
-            if (pnl_pct <= -STOP_LOSS_PCT) {
+            // Cálculo del umbral de salida dinámico
+            double trailing_stop_price = highest_price_since_entry_ * (1.0 - TRAILING_STOP_PCT);
+            double hard_stop_price = entry_price_ * (1.0 - INITIAL_STOP_PCT);
+            double exit_trigger = std::max(trailing_stop_price, hard_stop_price);
+
+            if (tick.price <= exit_trigger) {
                 portfolio_.sell(tick.price, 1);
                 entry_price_ = 0.0;
-            } else if (pnl_pct >= TAKE_PROFIT_PCT || z_score >= 1.8) {
-                portfolio_.sell(tick.price, 1);
-                entry_price_ = 0.0;
+                highest_price_since_entry_ = 0.0;
+                ticks_since_exit_ = 0; // Iniciar periodo de enfriamiento
             }
         } 
-        // 2. Entrada por sobreventa estadística
-        else if (portfolio_.get_position() == 0) {
-            if (z_score <= -Z_ENTRY) {
+        // 2. Búsqueda de Ruptura de Momentum (Entrada)
+        else if (portfolio_.get_position() == 0 && ticks_since_exit_ >= COOLDOWN_TICKS) {
+            // Encontrar el máximo de los últimos (WINDOW_SIZE - 1) ticks previos
+            double prev_high = 0.0;
+            for (size_t i = 0; i < price_window_.size() - 1; ++i) {
+                if (price_window_[i] > prev_high) {
+                    prev_high = price_window_[i];
+                }
+            }
+
+            double avg_volume = static_cast<double>(volume_sum_) / WINDOW_SIZE;
+
+            // Regla de Entrada:
+            // - El precio actual supera el máximo reciente (Ruptura alcista)
+            // - El volumen de este tick supera el promedio (Inyección de liquidez institucional)
+            if (tick.price > prev_high && tick.volume > (avg_volume * 1.2)) {
                 if (portfolio_.buy(tick.price, 1)) {
                     entry_price_ = tick.price;
+                    highest_price_since_entry_ = tick.price;
                 }
             }
         }
@@ -115,19 +135,17 @@ int main() {
 
     Portfolio portfolio(100'000.0);
     BacktestEngine engine(ARENA_SIZE);
-    RollingZScoreStrategy strategy(portfolio);
+    MomentumBreakoutStrategy strategy(portfolio);
     engine.register_strategy(&strategy);
 
     const char* curr = file_reader.data();
     const char* end = curr + file_reader.size();
 
-    // El archivo de Binance no tiene cabecera de texto, empieza directamente con datos
-    std::cout << "Ejecutando simulación sobre un día completo de mercado real...\n";
+    std::cout << "Ejecutando estrategia de Momentum Breakout con Trailing Stop...\n";
     auto start = std::chrono::high_resolution_clock::now();
 
     size_t lines_read = 0;
     while (curr < end) {
-        // Formato: id,price,qty,quote_qty,time,is_buyer_maker,is_best_match
         skip_column(curr, end); // saltar trade_id
 
         double price = parse_double(curr);
@@ -141,7 +159,6 @@ int main() {
         uint64_t ts_ms = parse_uint64(curr);
         uint64_t ts_ns = ts_ms * 1'000'000ULL;
 
-        // Saltar el resto de columnas hasta el fin de línea
         while (curr < end && *curr != '\n') curr++;
         if (curr < end) curr++;
 
