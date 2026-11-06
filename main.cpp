@@ -1,7 +1,7 @@
 #include <iostream>
 #include <chrono>
 #include <iomanip>
-#include <charconv>
+#include <deque>
 #include <cmath>
 #include "Engine.hpp"
 #include "Portfolio.hpp"
@@ -34,48 +34,67 @@ inline double parse_double(const char*& ptr) {
     return int_part;
 }
 
-class FastTickStrategy : public IStrategy {
+class RollingZScoreStrategy : public IStrategy {
 private:
     Portfolio& portfolio_;
     double entry_price_{0.0};
     double last_price_{0.0};
 
-    uint64_t count_{0};
-    double mean_{0.0};
-    double m2_{0.0};
+    // Ventana rodante para no sesgar la media con datos viejos
+    static constexpr size_t WINDOW_SIZE = 100;
+    std::deque<double> price_window_;
+    double rolling_sum_{0.0};
 
-    static constexpr double STOP_LOSS_PCT = 0.008;   // 0.8% stop
-    static constexpr double TAKE_PROFIT_PCT = 0.012; // 1.2% take-profit
+    // Parámetros de riesgo para datos reales
+    static constexpr double STOP_LOSS_PCT = 0.005;   // 0.5% Stop loss
+    static constexpr double TAKE_PROFIT_PCT = 0.008; // 0.8% Take profit
+    static constexpr double Z_ENTRY = 2.0;           // 2 desviaciones estándar
 
 public:
-    explicit FastTickStrategy(Portfolio& p) : portfolio_(p) {}
+    explicit RollingZScoreStrategy(Portfolio& p) : portfolio_(p) {}
 
     void on_tick(const Tick& tick) override {
         last_price_ = tick.price;
-        count_++;
 
-        double delta = tick.price - mean_;
-        mean_ += delta / count_;
-        double delta2 = tick.price - mean_;
-        m2_ += delta * delta2;
+        // Mantenimiento de la ventana rodante en O(1)
+        price_window_.push_back(tick.price);
+        rolling_sum_ += tick.price;
 
-        if (count_ < 200) return;
+        if (price_window_.size() > WINDOW_SIZE) {
+            rolling_sum_ -= price_window_.front();
+            price_window_.pop_front();
+        }
 
-        double variance = m2_ / (count_ - 1);
-        double std_dev = std::sqrt(variance);
-        if (std_dev < 1e-6) return;
+        if (price_window_.size() < WINDOW_SIZE) return;
 
-        double z_score = (tick.price - mean_) / std_dev;
+        double mean = rolling_sum_ / WINDOW_SIZE;
 
+        // Varianza sobre la ventana
+        double var_sum = 0.0;
+        for (double p : price_window_) {
+            var_sum += (p - mean) * (p - mean);
+        }
+        double std_dev = std::sqrt(var_sum / WINDOW_SIZE);
+        if (std_dev < 1e-4) return;
+
+        double z_score = (tick.price - mean) / std_dev;
+
+        // 1. Gestión de Posición Abierta
         if (portfolio_.get_position() > 0) {
             double pnl_pct = (tick.price - entry_price_) / entry_price_;
-            if (pnl_pct <= -STOP_LOSS_PCT || pnl_pct >= TAKE_PROFIT_PCT || z_score >= 1.8) {
-                portfolio_.sell(tick.price, 100);
+
+            if (pnl_pct <= -STOP_LOSS_PCT) {
+                portfolio_.sell(tick.price, 1); // 1 unidad
+                entry_price_ = 0.0;
+            } else if (pnl_pct >= TAKE_PROFIT_PCT || z_score >= 1.5) {
+                portfolio_.sell(tick.price, 1);
                 entry_price_ = 0.0;
             }
-        } else if (portfolio_.get_position() == 0) {
-            if (z_score <= -1.8) {
-                if (portfolio_.buy(tick.price, 100)) {
+        } 
+        // 2. Entrada: Comprar cuando hay sobreventa estadística local
+        else if (portfolio_.get_position() == 0) {
+            if (z_score <= -Z_ENTRY) {
+                if (portfolio_.buy(tick.price, 1)) {
                     entry_price_ = tick.price;
                 }
             }
@@ -86,14 +105,16 @@ public:
 };
 
 int main() {
-    constexpr size_t ARENA_SIZE = 128 * 1024 * 1024; // 128 MB
+    constexpr size_t ARENA_SIZE = 64 * 1024 * 1024; // 64 MB suficiente para este lote
 
-    std::cout << "Mapeando 'ticks.csv' a memoria con mmap..." << std::endl;
-    FastFileReader file_reader("ticks.csv");
+    const std::string datafile = "real_ticks.csv";
+    std::cout << "Mapeando '" << datafile << "' a memoria con mmap..." << std::endl;
+    FastFileReader file_reader(datafile);
 
+    // Ajustamos capital inicial a $100,000 USD
     Portfolio portfolio(100'000.0);
     BacktestEngine engine(ARENA_SIZE);
-    FastTickStrategy strategy(portfolio);
+    RollingZScoreStrategy strategy(portfolio);
     engine.register_strategy(&strategy);
 
     const char* curr = file_reader.data();
@@ -103,7 +124,7 @@ int main() {
     while (curr < end && *curr != '\n') curr++;
     if (curr < end) curr++;
 
-    std::cout << "Iniciando procesamiento zero-copy desde memoria mapeada...\n";
+    std::cout << "Ejecutando simulación sobre transacciones reales de mercado...\n";
     auto start = std::chrono::high_resolution_clock::now();
 
     size_t lines_read = 0;
@@ -130,9 +151,9 @@ int main() {
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> elapsed = end_time - start;
 
-    std::cout << "\nTiempo total (mmap + parse + backtest): " << elapsed.count() << " ms" << std::endl;
-    std::cout << "Lineas leidas y procesadas           : " << lines_read << std::endl;
-    std::cout << "Throughput global                    : "
+    std::cout << "\nTiempo total de ejecución: " << elapsed.count() << " ms" << std::endl;
+    std::cout << "Transacciones reales procesadas: " << lines_read << std::endl;
+    std::cout << "Throughput: "
               << std::fixed << std::setprecision(2)
               << (lines_read / (elapsed.count() / 1000.0)) / 1'000'000.0
               << " M ticks/seg" << std::endl;
