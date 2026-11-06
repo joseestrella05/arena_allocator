@@ -1,0 +1,15 @@
+# Binarios compilados
+*_bin
+arena_bench
+engine_bench
+full_trader
+*.o
+*.out
+
+# Archivos de depuración y logs de macOS
+.DS_Store
+*.dSYM/
+
+# Configuración de editor local
+.vscode/
+build/
