@@ -21,3 +21,16 @@ Pruebas ejecutadas en **Apple Silicon (M-Series ARM64)** con compilador Clang (`
 ---
 
 ## Arquitectura de Sistemas de Bajo Nivel
+BTCUSDT-trades.csv ]
+│
+▼  (mmap + madvise MADV_WILLNEED / MADV_SEQUENTIAL)
+[ FastFileReader ] ──> Cero copias a memoria intermedia
+│
+▼  (Parsing numérico en línea sin std::string)
+[ ArenaAllocator ] ──> Bloques contiguos alineados a 64 bits (sin fragmentación)
+│
+▼
+[ Momentum Breakout Engine ] ──> Donchian Channel + Filtro de Volumen Institucional
+│
+▼
+[ Portfolio Risk Engine ] ──> 0.04% Taker fee + 0.02% Slippage + Max DD + Sharpe Ratio
