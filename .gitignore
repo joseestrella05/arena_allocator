@@ -16,3 +16,6 @@ build/
 *.csv
 gen_ticks
 mmap_backtest
+*.zip
+BTCUSDT-trades-*.csv
+real_ticks.csv
