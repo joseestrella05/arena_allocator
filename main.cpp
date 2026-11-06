@@ -1,44 +1,65 @@
 #include <iostream>
 #include <chrono>
 #include <iomanip>
-#include <random>
+#include <charconv>
 #include <cmath>
 #include "Engine.hpp"
 #include "Portfolio.hpp"
+#include "FastFileReader.hpp"
 
-class RiskManagedVWAPStrategy : public IStrategy {
+inline uint64_t parse_uint64(const char*& ptr) {
+    uint64_t val = 0;
+    while (*ptr >= '0' && *ptr <= '9') {
+        val = val * 10 + (*ptr - '0');
+        ptr++;
+    }
+    return val;
+}
+
+inline double parse_double(const char*& ptr) {
+    double int_part = 0.0;
+    while (*ptr >= '0' && *ptr <= '9') {
+        int_part = int_part * 10.0 + (*ptr - '0');
+        ptr++;
+    }
+    if (*ptr == '.') {
+        ptr++;
+        double factor = 0.1;
+        while (*ptr >= '0' && *ptr <= '9') {
+            int_part += (*ptr - '0') * factor;
+            factor *= 0.1;
+            ptr++;
+        }
+    }
+    return int_part;
+}
+
+class FastTickStrategy : public IStrategy {
 private:
     Portfolio& portfolio_;
-    
-    // Parámetros de ejecución
     double entry_price_{0.0};
     double last_price_{0.0};
-    
-    // Estadísticas incrementales en línea (Algoritmo de Welford para media y varianza)
+
     uint64_t count_{0};
     double mean_{0.0};
-    double m2_{0.0}; // Suma de diferencias al cuadrado respecto a la media
+    double m2_{0.0};
 
-    // Umbrales de riesgo
-    static constexpr double STOP_LOSS_PCT = 0.010;   // 1.0% pérdida máxima tolerada
-    static constexpr double TAKE_PROFIT_PCT = 0.015; // 1.5% toma de ganancias
-    static constexpr double Z_SCORE_BUY = -2.0;      // 2 sigmas por debajo
+    static constexpr double STOP_LOSS_PCT = 0.008;   // 0.8% stop
+    static constexpr double TAKE_PROFIT_PCT = 0.012; // 1.2% take-profit
 
 public:
-    explicit RiskManagedVWAPStrategy(Portfolio& p) : portfolio_(p) {}
+    explicit FastTickStrategy(Portfolio& p) : portfolio_(p) {}
 
     void on_tick(const Tick& tick) override {
         last_price_ = tick.price;
         count_++;
 
-        // Actualización de Welford en O(1)
         double delta = tick.price - mean_;
         mean_ += delta / count_;
         double delta2 = tick.price - mean_;
         m2_ += delta * delta2;
 
-        // Necesitamos al menos 100 observaciones para que la desviación estándar tenga sentido
-        if (count_ < 100) return;
+        if (count_ < 200) return;
 
         double variance = m2_ / (count_ - 1);
         double std_dev = std::sqrt(variance);
@@ -46,23 +67,14 @@ public:
 
         double z_score = (tick.price - mean_) / std_dev;
 
-        // 1. Control de posición abierta (Stop-Loss y Take-Profit prioritarios)
         if (portfolio_.get_position() > 0) {
             double pnl_pct = (tick.price - entry_price_) / entry_price_;
-
-            if (pnl_pct <= -STOP_LOSS_PCT) {
-                // Ejecución de Stop-Loss para cortar pérdida
-                portfolio_.sell(tick.price, 100);
-                entry_price_ = 0.0;
-            } else if (pnl_pct >= TAKE_PROFIT_PCT || z_score >= 2.0) {
-                // Ejecución de Take-Profit o reversión estadística completada
+            if (pnl_pct <= -STOP_LOSS_PCT || pnl_pct >= TAKE_PROFIT_PCT || z_score >= 1.8) {
                 portfolio_.sell(tick.price, 100);
                 entry_price_ = 0.0;
             }
-        } 
-        // 2. Búsqueda de nueva entrada solo si no tenemos posición abierta
-        else if (portfolio_.get_position() == 0) {
-            if (z_score <= Z_SCORE_BUY) {
+        } else if (portfolio_.get_position() == 0) {
+            if (z_score <= -1.8) {
                 if (portfolio_.buy(tick.price, 100)) {
                     entry_price_ = tick.price;
                 }
@@ -70,60 +82,63 @@ public:
         }
     }
 
-    [[nodiscard]] double get_last_price() const noexcept {
-        return last_price_;
-    }
+    [[nodiscard]] double get_last_price() const noexcept { return last_price_; }
 };
 
 int main() {
-    constexpr size_t BATCH_SIZE = 5'000'000;
-    constexpr size_t ARENA_SIZE = 180 * 1024 * 1024; 
+    constexpr size_t ARENA_SIZE = 128 * 1024 * 1024; // 128 MB
+
+    std::cout << "Mapeando 'ticks.csv' a memoria con mmap..." << std::endl;
+    FastFileReader file_reader("ticks.csv");
 
     Portfolio portfolio(100'000.0);
     BacktestEngine engine(ARENA_SIZE);
-    RiskManagedVWAPStrategy strategy(portfolio);
-
+    FastTickStrategy strategy(portfolio);
     engine.register_strategy(&strategy);
 
-    std::cout << "Ejecutando simulación con Control de Riesgo (Stop-Loss/Take-Profit/Z-Score)..." << std::endl;
+    const char* curr = file_reader.data();
+    const char* end = curr + file_reader.size();
 
-    std::mt19937_64 rng(42); // Misma semilla para comparar exactamente contra el test anterior
-    std::normal_distribution<double> normal_dist(0.0, 1.0);
+    // Saltar cabecera
+    while (curr < end && *curr != '\n') curr++;
+    if (curr < end) curr++;
 
-    double price = 100.00;
-    constexpr double dt = 1.0 / (252.0 * 6.5 * 3600.0);
-    constexpr double drift = 0.05;
-    constexpr double volatility = 0.20;
-
+    std::cout << "Iniciando procesamiento zero-copy desde memoria mapeada...\n";
     auto start = std::chrono::high_resolution_clock::now();
 
-    for (size_t i = 0; i < BATCH_SIZE; ++i) {
-        double z = normal_dist(rng);
-        double delta_price = price * (drift * dt + volatility * std::sqrt(dt) * z);
-        price += delta_price;
+    size_t lines_read = 0;
+    while (curr < end) {
+        uint64_t ts = parse_uint64(curr);
+        if (*curr == ',') curr++;
 
-        uint32_t vol = 50 + (i % 100);
+        const char* sym_start = curr;
+        while (curr < end && *curr != ',') curr++;
+        std::string_view sym(sym_start, curr - sym_start);
+        if (*curr == ',') curr++;
 
-        engine.process_tick(
-            1700000000000000ULL + i * 1000,
-            price,
-            vol,
-            EventType::TRADE,
-            "SPY"
-        );
+        double price = parse_double(curr);
+        if (*curr == ',') curr++;
+
+        uint32_t vol = static_cast<uint32_t>(parse_uint64(curr));
+        while (curr < end && *curr != '\n') curr++;
+        if (curr < end) curr++;
+
+        engine.process_tick(ts, price, vol, EventType::TRADE, sym);
+        lines_read++;
     }
 
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> elapsed = end - start;
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> elapsed = end_time - start;
 
-    std::cout << "\nTiempo de simulación: " << elapsed.count() << " ms" << std::endl;
-    std::cout << "Throughput         : " 
+    std::cout << "\nTiempo total (mmap + parse + backtest): " << elapsed.count() << " ms" << std::endl;
+    std::cout << "Lineas leidas y procesadas           : " << lines_read << std::endl;
+    std::cout << "Throughput global                    : "
               << std::fixed << std::setprecision(2)
-              << (BATCH_SIZE / (elapsed.count() / 1000.0)) / 1'000'000.0 
+              << (lines_read / (elapsed.count() / 1000.0)) / 1'000'000.0
               << " M ticks/seg" << std::endl;
 
     portfolio.print_summary(strategy.get_last_price());
-
     engine.reset_memory();
+
     return 0;
 }

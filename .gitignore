@@ -13,3 +13,6 @@ full_trader
 # Configuración de editor local
 .vscode/
 build/
+*.csv
+gen_ticks
+mmap_backtest
