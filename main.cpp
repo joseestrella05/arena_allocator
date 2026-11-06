@@ -47,19 +47,17 @@ private:
     double highest_price_since_entry_{0.0};
     double last_price_{0.0};
 
-    // Parámetros de ventana para canal y volumen
-    static constexpr size_t WINDOW_SIZE = 600; // ~600 ticks para detectar niveles clave
+    static constexpr double POSITION_SIZE_BTC = 0.5; // 0.5 BTC por operación
+    static constexpr size_t WINDOW_SIZE = 600;
     std::deque<double> price_window_;
     std::deque<uint32_t> volume_window_;
     uint64_t volume_sum_{0};
 
-    // Parámetros de gestión de salida dinámica
-    static constexpr double INITIAL_STOP_PCT = 0.004;  // 0.4% Stop inicial de seguridad
-    static constexpr double TRAILING_STOP_PCT = 0.003; // 0.3% Trailing stop dinámico
+    static constexpr double INITIAL_STOP_PCT = 0.005;  // 0.5% stop inicial
+    static constexpr double TRAILING_STOP_PCT = 0.004; // 0.4% trailing stop
     
-    // Filtro de enfriamiento
     uint64_t ticks_since_exit_{1000};
-    static constexpr uint64_t COOLDOWN_TICKS = 300;
+    static constexpr uint64_t COOLDOWN_TICKS = 400;
 
 public:
     explicit MomentumBreakoutStrategy(Portfolio& p) : portfolio_(p) {}
@@ -68,7 +66,6 @@ public:
         last_price_ = tick.price;
         ticks_since_exit_++;
 
-        // Actualización de ventana rodante de precios
         price_window_.push_back(tick.price);
         volume_window_.push_back(tick.volume);
         volume_sum_ += tick.volume;
@@ -82,26 +79,24 @@ public:
         if (price_window_.size() < WINDOW_SIZE) return;
 
         // 1. Gestión de Posición Abierta con Trailing Stop
-        if (portfolio_.get_position() > 0) {
+        if (portfolio_.get_position() > 0.0) {
             if (tick.price > highest_price_since_entry_) {
                 highest_price_since_entry_ = tick.price;
             }
 
-            // Cálculo del umbral de salida dinámico
             double trailing_stop_price = highest_price_since_entry_ * (1.0 - TRAILING_STOP_PCT);
             double hard_stop_price = entry_price_ * (1.0 - INITIAL_STOP_PCT);
             double exit_trigger = std::max(trailing_stop_price, hard_stop_price);
 
             if (tick.price <= exit_trigger) {
-                portfolio_.sell(tick.price, 1);
+                portfolio_.sell(tick.price, POSITION_SIZE_BTC);
                 entry_price_ = 0.0;
                 highest_price_since_entry_ = 0.0;
-                ticks_since_exit_ = 0; // Iniciar periodo de enfriamiento
+                ticks_since_exit_ = 0;
             }
         } 
-        // 2. Búsqueda de Ruptura de Momentum (Entrada)
-        else if (portfolio_.get_position() == 0 && ticks_since_exit_ >= COOLDOWN_TICKS) {
-            // Encontrar el máximo de los últimos (WINDOW_SIZE - 1) ticks previos
+        // 2. Búsqueda de Ruptura con Flujo de Volumen
+        else if (portfolio_.get_position() == 0.0 && ticks_since_exit_ >= COOLDOWN_TICKS) {
             double prev_high = 0.0;
             for (size_t i = 0; i < price_window_.size() - 1; ++i) {
                 if (price_window_[i] > prev_high) {
@@ -111,11 +106,9 @@ public:
 
             double avg_volume = static_cast<double>(volume_sum_) / WINDOW_SIZE;
 
-            // Regla de Entrada:
-            // - El precio actual supera el máximo reciente (Ruptura alcista)
-            // - El volumen de este tick supera el promedio (Inyección de liquidez institucional)
-            if (tick.price > prev_high && tick.volume > (avg_volume * 1.2)) {
-                if (portfolio_.buy(tick.price, 1)) {
+            // Filtro estricto: Ruptura del máximo + volumen institucional (1.3x media)
+            if (tick.price > prev_high && tick.volume > (avg_volume * 1.3)) {
+                if (portfolio_.buy(tick.price, POSITION_SIZE_BTC)) {
                     entry_price_ = tick.price;
                     highest_price_since_entry_ = tick.price;
                 }
@@ -127,7 +120,7 @@ public:
 };
 
 int main() {
-    constexpr size_t ARENA_SIZE = 128 * 1024 * 1024; // 128 MB
+    constexpr size_t ARENA_SIZE = 128 * 1024 * 1024;
 
     const std::string datafile = "BTCUSDT-trades-2024-01-01.csv";
     std::cout << "Mapeando '" << datafile << "' a memoria con mmap..." << std::endl;
@@ -141,12 +134,12 @@ int main() {
     const char* curr = file_reader.data();
     const char* end = curr + file_reader.size();
 
-    std::cout << "Ejecutando estrategia de Momentum Breakout con Trailing Stop...\n";
+    std::cout << "Evaluando Momentum con comisiones Taker (0.04%) y Slippage (0.02%)...\n";
     auto start = std::chrono::high_resolution_clock::now();
 
     size_t lines_read = 0;
     while (curr < end) {
-        skip_column(curr, end); // saltar trade_id
+        skip_column(curr, end); // trade_id
 
         double price = parse_double(curr);
         if (curr < end && *curr == ',') curr++;
@@ -154,7 +147,7 @@ int main() {
         double qty = parse_double(curr);
         if (curr < end && *curr == ',') curr++;
 
-        skip_column(curr, end); // saltar quote_qty
+        skip_column(curr, end); // quote_qty
 
         uint64_t ts_ms = parse_uint64(curr);
         uint64_t ts_ns = ts_ms * 1'000'000ULL;
