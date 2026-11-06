@@ -25,6 +25,7 @@ Motor de backtesting cuantitativo de ultra-baja latencia, diseñado para operar 
 4. [Reporte de riesgo y backtesting](#4-reporte-de-riesgo-y-backtesting)
 5. [Estructura del repositorio](#5-estructura-del-repositorio)
 6. [Compilación y ejecución](#6-compilación-y-ejecución)
+7. [Licencia](#licencia)
 
 ---
 
@@ -151,7 +152,6 @@ Posición remanente     : 0.50 BTC
 Max Drawdown (Caída)   : 0.24%
 Sharpe Ratio (Anual)   : 182.666
 ==========================================
-```
 
 **Notas de interpretación**
 
@@ -181,25 +181,16 @@ arena-allocator/
 **Requisitos:** macOS en Apple Silicon (ARM64) y Apple Clang con soporte C++20 (Xcode Command Line Tools).
 
 ```bash
-# 1. Clonar
-git clone https://github.com/<usuario>/arena-allocator.git
-cd arena-allocator
 
-# 2. Obtener el dataset (Binance Spot, trades diarios)
-curl -O https://data.binance.vision/data/spot/daily/trades/BTCUSDT/BTCUSDT-trades-2024-01-01.zip
-unzip BTCUSDT-trades-2024-01-01.zip
-
-# 3. Compilar
+# 1. Compilar
 clang++ -std=c++20 -O3 -Wall -Wextra main.cpp -o arena_backtest
 
-# 4. Ejecutar
+# 2. Ejecutar
 ./arena_backtest
 ```
-
-Los tiempos dependen del hardware y del estado de la caché de páginas del sistema. Para resultados comparables, ejecutar varias veces y descartar la primera corrida (arranque en frío del archivo).
-
-## Licencia
+---
+## 7. Licencia 
 
 MIT
+EOF
 
-Nota: en la sección de memoria omití "(64 bits)" junto a alignof(std::max_align_t). En ARM64 de Apple ese valor es 16 bytes (128 bits), así que ese dato sería incorrecto en un README técnico. Tampoco verifiqué que la ruta del dataset, la URL de Binance y el nombre del ejecutable coincidan con tu repo.
