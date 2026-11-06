@@ -6,29 +6,67 @@
 #include "Engine.hpp"
 #include "Portfolio.hpp"
 
-class LiveVWAPStrategy : public IStrategy {
+class RiskManagedVWAPStrategy : public IStrategy {
 private:
     Portfolio& portfolio_;
-    double cumulative_dollar_volume_{0.0};
-    uint64_t cumulative_volume_{0};
+    
+    // Parámetros de ejecución
+    double entry_price_{0.0};
     double last_price_{0.0};
+    
+    // Estadísticas incrementales en línea (Algoritmo de Welford para media y varianza)
+    uint64_t count_{0};
+    double mean_{0.0};
+    double m2_{0.0}; // Suma de diferencias al cuadrado respecto a la media
+
+    // Umbrales de riesgo
+    static constexpr double STOP_LOSS_PCT = 0.010;   // 1.0% pérdida máxima tolerada
+    static constexpr double TAKE_PROFIT_PCT = 0.015; // 1.5% toma de ganancias
+    static constexpr double Z_SCORE_BUY = -2.0;      // 2 sigmas por debajo
 
 public:
-    explicit LiveVWAPStrategy(Portfolio& p) : portfolio_(p) {}
+    explicit RiskManagedVWAPStrategy(Portfolio& p) : portfolio_(p) {}
 
     void on_tick(const Tick& tick) override {
         last_price_ = tick.price;
-        cumulative_dollar_volume_ += tick.price * tick.volume;
-        cumulative_volume_ += tick.volume;
+        count_++;
 
-        double current_vwap = cumulative_dollar_volume_ / cumulative_volume_;
-        double deviation = (tick.price - current_vwap) / current_vwap;
+        // Actualización de Welford en O(1)
+        double delta = tick.price - mean_;
+        mean_ += delta / count_;
+        double delta2 = tick.price - mean_;
+        m2_ += delta * delta2;
 
-        // Reglas de entrada y salida con umbrales ajustados
-        if (deviation < -0.002 && portfolio_.get_position() == 0) {
-            portfolio_.buy(tick.price, 100);
-        } else if (deviation > 0.002 && portfolio_.get_position() > 0) {
-            portfolio_.sell(tick.price, 100);
+        // Necesitamos al menos 100 observaciones para que la desviación estándar tenga sentido
+        if (count_ < 100) return;
+
+        double variance = m2_ / (count_ - 1);
+        double std_dev = std::sqrt(variance);
+        if (std_dev < 1e-6) return;
+
+        double z_score = (tick.price - mean_) / std_dev;
+
+        // 1. Control de posición abierta (Stop-Loss y Take-Profit prioritarios)
+        if (portfolio_.get_position() > 0) {
+            double pnl_pct = (tick.price - entry_price_) / entry_price_;
+
+            if (pnl_pct <= -STOP_LOSS_PCT) {
+                // Ejecución de Stop-Loss para cortar pérdida
+                portfolio_.sell(tick.price, 100);
+                entry_price_ = 0.0;
+            } else if (pnl_pct >= TAKE_PROFIT_PCT || z_score >= 2.0) {
+                // Ejecución de Take-Profit o reversión estadística completada
+                portfolio_.sell(tick.price, 100);
+                entry_price_ = 0.0;
+            }
+        } 
+        // 2. Búsqueda de nueva entrada solo si no tenemos posición abierta
+        else if (portfolio_.get_position() == 0) {
+            if (z_score <= Z_SCORE_BUY) {
+                if (portfolio_.buy(tick.price, 100)) {
+                    entry_price_ = tick.price;
+                }
+            }
         }
     }
 
@@ -43,26 +81,23 @@ int main() {
 
     Portfolio portfolio(100'000.0);
     BacktestEngine engine(ARENA_SIZE);
-    LiveVWAPStrategy strategy(portfolio);
+    RiskManagedVWAPStrategy strategy(portfolio);
 
     engine.register_strategy(&strategy);
 
-    std::cout << "Generando y procesando " << BATCH_SIZE 
-              << " ticks con Movimiento Browniano Geométrico (GBM)..." << std::endl;
+    std::cout << "Ejecutando simulación con Control de Riesgo (Stop-Loss/Take-Profit/Z-Score)..." << std::endl;
 
-    // Generador pseudoaleatorio de alta velocidad (Mersenne Twister)
-    std::mt19937_64 rng(42); // Semilla fija para reproducibilidad
+    std::mt19937_64 rng(42); // Misma semilla para comparar exactamente contra el test anterior
     std::normal_distribution<double> normal_dist(0.0, 1.0);
 
     double price = 100.00;
-    constexpr double dt = 1.0 / (252.0 * 6.5 * 3600.0); // Paso temporal (segundos de mercado)
-    constexpr double drift = 0.05;                      // 5% anual esperado
-    constexpr double volatility = 0.20;                 // 20% volatilidad anualizada
+    constexpr double dt = 1.0 / (252.0 * 6.5 * 3600.0);
+    constexpr double drift = 0.05;
+    constexpr double volatility = 0.20;
 
     auto start = std::chrono::high_resolution_clock::now();
 
     for (size_t i = 0; i < BATCH_SIZE; ++i) {
-        // Fórmula GBM: dS = S * (mu*dt + sigma*sqrt(dt)*Z)
         double z = normal_dist(rng);
         double delta_price = price * (drift * dt + volatility * std::sqrt(dt) * z);
         price += delta_price;
@@ -87,7 +122,6 @@ int main() {
               << (BATCH_SIZE / (elapsed.count() / 1000.0)) / 1'000'000.0 
               << " M ticks/seg" << std::endl;
 
-    // Reporte cuantitativo con Sharpe y Max Drawdown
     portfolio.print_summary(strategy.get_last_price());
 
     engine.reset_memory();
